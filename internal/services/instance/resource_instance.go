@@ -59,7 +59,7 @@ func (r *InstanceResource) Schema(ctx context.Context, _ resource.SchemaRequest,
 	resp.Schema = schema.Schema{
 		Description: "Manages a Vast.ai GPU instance. Instances are created from GPU offers and support " +
 			"full lifecycle management including start/stop, label and bid price updates, template changes, " +
-			"SSH key attachment, and spot instance preemption handling.",
+			"SSH key attachment, and tracking of interrupted spot instances.",
 
 		Attributes: map[string]schema.Attribute{
 			// ========== Computed, stable (UseStateForUnknown) ==========
@@ -479,12 +479,19 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 		"offer_id":    offerID,
 	})
 
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), strconv.Itoa(contractID))...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	// Poll until running per COMP-05
 	instance, err := r.client.Instances.WaitForStatus(ctx, contractID, "running", createTimeout)
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error Waiting for Instance",
-			fmt.Sprintf("Instance %d was created but failed to reach 'running' status: %s", contractID, err),
+			fmt.Sprintf("Instance %d was created but failed to reach 'running' status: %s. "+
+				"The instance is kept in state as tainted and will be destroyed by the next apply or destroy.",
+				contractID, err),
 		)
 		return
 	}
@@ -534,8 +541,6 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 }
 
 // Read refreshes the instance state from the API.
-// Handles preemption detection per D-09: spot instances that were preempted are
-// silently removed from state, while normal state changes are reflected normally.
 func (r *InstanceResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var model InstanceResourceModel
 
@@ -581,20 +586,6 @@ func (r *InstanceResource) Read(ctx context.Context, req resource.ReadRequest, r
 			"Error Reading Instance",
 			fmt.Sprintf("Could not read instance %d: %s", id, err),
 		)
-		return
-	}
-
-	// Preemption detection per D-09
-	// Only remove from state when instance was ACTUALLY preempted:
-	// is_bid=true AND intended_status="running" AND actual_status indicates preemption
-	if isPreempted(instance) {
-		tflog.Warn(ctx, "Instance appears to have been preempted, removing from state", map[string]interface{}{
-			"instance_id":     id,
-			"is_bid":          instance.IsBid,
-			"intended_status": instance.IntendedStatus,
-			"actual_status":   instance.ActualStatus,
-		})
-		resp.State.RemoveResource(ctx)
 		return
 	}
 
@@ -930,26 +921,6 @@ func (r *InstanceResource) Delete(ctx context.Context, req resource.DeleteReques
 // Usage: terraform import vastai_instance.example <contract_id>.
 func (r *InstanceResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
-}
-
-// isPreempted determines whether an instance was preempted (outbid/evicted).
-// Per D-09: only spot instances (is_bid=true) that intended to be running
-// but were forced to stop are considered preempted.
-func isPreempted(instance *client.Instance) bool {
-	if !instance.IsBid {
-		return false
-	}
-	if instance.IntendedStatus != "running" {
-		return false
-	}
-	// Preemption indicators: the instance was supposed to be running
-	// but is actually in a stopped/offline state, indicating it was
-	// outbid or evicted by the host.
-	preemptionStatuses := map[string]bool{
-		"stopped": true,
-		"offline": true,
-	}
-	return preemptionStatuses[instance.ActualStatus]
 }
 
 // mapInstanceToModel converts an API Instance struct to a Terraform InstanceResourceModel.

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep a created `vastai_instance` in state as tainted when it fails to reach `running`, so the next apply or destroy removes it instead of leaving an untracked billed instance.
+- Keep interrupted spot instances in state instead of silently dropping them; Vast.ai pauses outbid instances, keeps billing their storage, and resumes them when they regain priority.
+
 ## [0.3.2] - 2026-09-20
 
 ### Fixed

@@ -12,10 +12,12 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
 	"github.com/realnedsanders/terraform-provider-vastai/internal/client"
 )
@@ -225,6 +227,78 @@ func TestInstanceResource_Read_NullInstanceRemovesState(t *testing.T) {
 	}
 	if !resp.State.Raw.IsNull() {
 		t.Fatalf("Read state = %s, want removed resource", resp.State.Raw)
+	}
+}
+
+func TestInstanceResourceCreate_KeepsIDInStateWhenWaitFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method == http.MethodPut {
+			_, _ = w.Write([]byte(`{"success":true,"new_contract":42}`))
+			return
+		}
+
+		_, _ = w.Write([]byte(`{"instances":{"id":42,"actual_status":"exited","status_msg":"image pull failed"}}`))
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	stateSchema := getTestSchema(t)
+	resp := &resource.CreateResponse{State: tfsdk.State{
+		Schema: stateSchema,
+		Raw:    tftypes.NewValue(stateSchema.Type().TerraformType(ctx), nil),
+	}}
+	r := &InstanceResource{client: client.NewVastAIClient("test-key", server.URL, "test")}
+	r.Create(ctx, resource.CreateRequest{Plan: testInstanceCreatePlan(t, 7)}, resp)
+
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("Create returned no error for an instance that exited during creation")
+	}
+
+	var id types.String
+	if diags := resp.State.GetAttribute(ctx, path.Root("id"), &id); diags.HasError() {
+		t.Fatalf("reading id from create state: %v", diags)
+	}
+
+	if id.ValueString() != "42" {
+		t.Fatalf("create state id = %s, want 42 so the created instance stays tracked", id)
+	}
+}
+
+func TestInstanceResource_Read_KeepsInterruptedSpotInstance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if strings.HasSuffix(r.URL.Path, "/ssh/") {
+			_, _ = w.Write([]byte(`{"ssh_keys":"[]"}`))
+			return
+		}
+
+		_, _ = w.Write([]byte(`{"instances":{"id":42,"is_bid":true,"intended_status":"running","actual_status":"stopped"}}`))
+	}))
+	defer server.Close()
+
+	state := testInstanceResourceState(t, "42")
+	r := &InstanceResource{client: client.NewVastAIClient("test-key", server.URL, "test")}
+	resp := &resource.ReadResponse{State: state}
+	r.Read(context.Background(), resource.ReadRequest{State: state}, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("Read returned errors: %v", resp.Diagnostics)
+	}
+
+	if resp.State.Raw.IsNull() {
+		t.Fatal("Read removed an interrupted spot instance that still exists and bills for storage")
+	}
+
+	var actualStatus types.String
+	if diags := resp.State.GetAttribute(context.Background(), path.Root("actual_status"), &actualStatus); diags.HasError() {
+		t.Fatalf("reading actual_status: %v", diags)
+	}
+
+	if actualStatus.ValueString() != "stopped" {
+		t.Fatalf("actual_status = %s, want stopped", actualStatus)
 	}
 }
 
@@ -439,97 +513,6 @@ func TestInstanceResourceSchema_Timeouts(t *testing.T) {
 	_, ok := s.Blocks["timeouts"]
 	if !ok {
 		t.Fatal("expected timeouts block to exist (SCHM-06)")
-	}
-}
-
-// TestPreemptionDetection verifies the preemption detection logic.
-// Per D-09: only spot instances (is_bid=true) that intended to be running
-// but are actually stopped/offline should be considered preempted.
-func TestPreemptionDetection(t *testing.T) {
-	tests := []struct {
-		name     string
-		instance *client.Instance
-		expected bool
-	}{
-		{
-			name: "spot instance preempted (is_bid=true, intended=running, actual=stopped)",
-			instance: &client.Instance{
-				ID:             1,
-				IsBid:          true,
-				IntendedStatus: "running",
-				ActualStatus:   "stopped",
-			},
-			expected: true,
-		},
-		{
-			name: "spot instance preempted offline (is_bid=true, intended=running, actual=offline)",
-			instance: &client.Instance{
-				ID:             2,
-				IsBid:          true,
-				IntendedStatus: "running",
-				ActualStatus:   "offline",
-			},
-			expected: true,
-		},
-		{
-			name: "on-demand instance stopped (is_bid=false, intended=running, actual=stopped)",
-			instance: &client.Instance{
-				ID:             3,
-				IsBid:          false,
-				IntendedStatus: "running",
-				ActualStatus:   "stopped",
-			},
-			expected: false,
-		},
-		{
-			name: "spot instance intentionally stopped (is_bid=true, intended=stopped, actual=stopped)",
-			instance: &client.Instance{
-				ID:             4,
-				IsBid:          true,
-				IntendedStatus: "stopped",
-				ActualStatus:   "stopped",
-			},
-			expected: false,
-		},
-		{
-			name: "spot instance running normally (is_bid=true, intended=running, actual=running)",
-			instance: &client.Instance{
-				ID:             5,
-				IsBid:          true,
-				IntendedStatus: "running",
-				ActualStatus:   "running",
-			},
-			expected: false,
-		},
-		{
-			name: "on-demand instance exited (is_bid=false, intended=running, actual=exited)",
-			instance: &client.Instance{
-				ID:             6,
-				IsBid:          false,
-				IntendedStatus: "running",
-				ActualStatus:   "exited",
-			},
-			expected: false,
-		},
-		{
-			name: "spot instance loading (is_bid=true, intended=running, actual=loading)",
-			instance: &client.Instance{
-				ID:             7,
-				IsBid:          true,
-				IntendedStatus: "running",
-				ActualStatus:   "loading",
-			},
-			expected: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := isPreempted(tt.instance)
-			if result != tt.expected {
-				t.Errorf("isPreempted() = %v, want %v", result, tt.expected)
-			}
-		})
 	}
 }
 

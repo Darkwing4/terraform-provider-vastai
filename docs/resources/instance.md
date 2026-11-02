@@ -7,7 +7,7 @@ description: |-
 
 # vastai_instance (Resource)
 
-Manages a Vast.ai GPU instance. Instances are created from GPU offers and support full lifecycle management including start/stop, label and bid price updates, template changes, SSH key attachment, and spot instance preemption handling.
+Manages a Vast.ai GPU instance. Instances are created from GPU offers and support full lifecycle management including start/stop, label and bid price updates, template changes, SSH key attachment, and tracking of interrupted spot instances.
 
 Use the `vastai_gpu_offers` data source to find available offers, then reference the offer ID when creating an instance.
 
